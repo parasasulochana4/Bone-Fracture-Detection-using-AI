@@ -1,18 +1,39 @@
 import { useState, useRef, useCallback } from 'react';
 import {
   Upload, Bone, ScanLine, Brain, CheckCircle2, XCircle,
-  Loader2, ChevronRight, RefreshCw, FileImage, ImageIcon,
-  HeartPulse, MessageSquare, Flame, ArrowRight,
+  Loader2, ChevronRight, RefreshCw, ImageIcon,
+  HeartPulse, MessageSquare, Flame, ArrowRight, AlertCircle,
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import SectionHeading from '@/components/SectionHeading';
 import { getTreatmentPlan } from '@/data/treatmentData';
 
+// Real X-ray sample images from Pexels (license-free stock photos)
 const sampleImages = [
-  { name: 'Non-Fracture Sample A', class: 'Non-Fracture', isFracture: false },
-  { name: 'Non-Fracture Sample B', class: 'Non-Fracture', isFracture: false },
-  { name: 'Fracture Sample A', class: 'Fracture', isFracture: true },
-  { name: 'Fracture Sample B', class: 'Fracture', isFracture: true },
+  {
+    name: 'X-ray Sample A',
+    url: 'https://images.pexels.com/photos/5723874/pexels-photo-5723874.jpeg?auto=compress&cs=tinysrgb&h=650&w=940',
+    isFracture: false,
+    isSample: true,
+  },
+  {
+    name: 'X-ray Sample B',
+    url: 'https://images.pexels.com/photos/5723885/pexels-photo-5723885.jpeg?auto=compress&cs=tinysrgb&h=650&w=940',
+    isFracture: false,
+    isSample: true,
+  },
+  {
+    name: 'X-ray Sample C',
+    url: 'https://images.pexels.com/photos/5722159/pexels-photo-5722159.jpeg?auto=compress&cs=tinysrgb&h=650&w=940',
+    isFracture: true,
+    isSample: true,
+  },
+  {
+    name: 'X-ray Sample D',
+    url: 'https://images.pexels.com/photos/7723513/pexels-photo-7723513.jpeg?auto=compress&cs=tinysrgb&h=650&w=940',
+    isFracture: true,
+    isSample: true,
+  },
 ];
 
 const modelOptions = [
@@ -25,10 +46,10 @@ const modelOptions = [
 
 interface SelectedImage {
   name: string;
+  url?: string;
   isFracture: boolean;
-  class: string;
-  previewUrl?: string;
-  isUploaded: boolean;
+  isSample: boolean;
+  file?: File;
 }
 
 interface PredictionResult {
@@ -37,28 +58,58 @@ interface PredictionResult {
   confidence: number;
   modelUsed: string;
   threshold: number;
+  features?: Record<string, number>;
 }
+
+/**
+ * Convert a File to a base64 string for sending to the edge function.
+ */
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+/**
+ * Fetch an image URL and convert to base64 for sending to the edge function.
+ */
+async function urlToBase64(url: string): Promise<string> {
+  const res = await fetch(url);
+  const blob = await res.blob();
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
 export default function DemoPage() {
   const [selectedModel, setSelectedModel] = useState('DENSENET121');
   const [selectedImage, setSelectedImage] = useState<SelectedImage | null>(null);
   const [result, setResult] = useState<PredictionResult | null>(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
   const [showTreatment, setShowTreatment] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFile = useCallback((file: File) => {
     if (!file.type.startsWith('image/')) return;
-    const previewUrl = URL.createObjectURL(file);
     setSelectedImage({
       name: file.name,
       isFracture: false,
-      class: 'Uploaded — unknown',
-      previewUrl,
-      isUploaded: true,
+      isSample: false,
+      file,
     });
     setResult(null);
+    setError(null);
     setShowTreatment(false);
   }, []);
 
@@ -74,54 +125,77 @@ export default function DemoPage() {
     if (file) handleFile(file);
   };
 
-  const handlePredict = () => {
+  const handlePredict = async () => {
     if (!selectedImage) return;
     setLoading(true);
     setResult(null);
+    setError(null);
     setShowTreatment(false);
 
-    setTimeout(() => {
-      let prob: number;
-      if (selectedImage.isUploaded) {
-        // For uploaded images with unknown ground truth, use a deterministic
-        // hash of the filename + model so the same image always gets the same
-        // prediction. This simulates consistent model behavior.
-        const seed = selectedImage.name.charCodeAt(0) +
-                     selectedImage.name.charCodeAt(selectedImage.name.length - 1) +
-                     selectedModel.charCodeAt(0);
-        const hash = ((seed * 9301 + 49297) % 233280) / 233280;
-        prob = 0.15 + hash * 0.7;
+    try {
+      // Convert the selected image to base64
+      let base64Image: string;
+      if (selectedImage.file) {
+        base64Image = await fileToBase64(selectedImage.file);
+      } else if (selectedImage.url) {
+        base64Image = await urlToBase64(selectedImage.url);
       } else {
-        // For sample images with known ground truth, always predict correctly
-        // with high confidence reflecting the model's 95.5% accuracy
-        if (selectedImage.isFracture) {
-          prob = 0.88 + Math.random() * 0.10;
-        } else {
-          prob = 0.02 + Math.random() * 0.10;
-        }
+        throw new Error('No image data available');
       }
-      const predictedClass = prob >= 0.5 ? 'Fracture' : 'Non-Fracture';
 
-      const prediction = {
-        predictedClass,
-        probability: prob,
-        confidence: Math.max(prob, 1 - prob),
-        modelUsed: modelOptions.find((m) => m.key === selectedModel)?.label || selectedModel,
-        threshold: 0.5,
+      // Call the edge function
+      const response = await fetch(`${SUPABASE_URL}/functions/v1/predict-fracture`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        },
+        body: JSON.stringify({
+          image: base64Image,
+          filename: selectedImage.name,
+          model_key: selectedModel,
+        }),
+      });
+
+      if (!response.ok) {
+        const errBody = await response.json().catch(() => ({}));
+        throw new Error(errBody.error || `Server error (${response.status})`);
+      }
+
+      const data = await response.json();
+
+      // Validate response shape
+      if (!data.predicted_class || typeof data.probability !== 'number') {
+        throw new Error('Invalid response from prediction server');
+      }
+
+      const prediction: PredictionResult = {
+        predictedClass: data.predicted_class,
+        probability: data.probability,
+        confidence: data.confidence,
+        modelUsed: data.model_used,
+        threshold: data.threshold,
+        features: data.features,
       };
+
       setResult(prediction);
-      setLoading(false);
       setShowTreatment(true);
 
-      // Store context for AI Doctor consultation
-      sessionStorage.setItem('predictionContext', `Predicted: ${predictedClass} (P=${prob.toFixed(4)}, Confidence=${Math.max(prob, 1 - prob).toFixed(4)}, Model=${prediction.modelUsed})`);
-    }, 1200);
+      sessionStorage.setItem(
+        'predictionContext',
+        `Predicted: ${prediction.predictedClass} (P=${prediction.probability.toFixed(4)}, Confidence=${prediction.confidence.toFixed(4)}, Model=${prediction.modelUsed})`
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Prediction failed. Please try again.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   const handleReset = () => {
-    if (selectedImage?.previewUrl) URL.revokeObjectURL(selectedImage.previewUrl);
     setSelectedImage(null);
     setResult(null);
+    setError(null);
     setShowTreatment(false);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
@@ -178,15 +252,19 @@ export default function DemoPage() {
               className="hidden"
             />
 
-            {selectedImage?.previewUrl ? (
+            {selectedImage ? (
               <div className="mb-4 overflow-hidden rounded-xl border border-slate-700 bg-slate-950">
                 <div className="relative">
-                  <img src={selectedImage.previewUrl} alt="Selected X-ray" className="max-h-64 w-full object-contain" />
+                  <img
+                    src={selectedImage.file ? URL.createObjectURL(selectedImage.file) : selectedImage.url}
+                    alt="Selected X-ray"
+                    className="max-h-64 w-full object-contain"
+                  />
                   <button
                     onClick={() => {
-                      if (selectedImage.previewUrl) URL.revokeObjectURL(selectedImage.previewUrl);
                       setSelectedImage(null);
                       setResult(null);
+                      setError(null);
                       setShowTreatment(false);
                       if (fileInputRef.current) fileInputRef.current.value = '';
                     }}
@@ -229,23 +307,28 @@ export default function DemoPage() {
                 <button
                   key={img.name}
                   onClick={() => {
-                    if (selectedImage?.previewUrl) URL.revokeObjectURL(selectedImage.previewUrl);
-                    setSelectedImage({ ...img, isUploaded: false });
+                    setSelectedImage({
+                      name: img.name,
+                      url: img.url,
+                      isFracture: img.isFracture,
+                      isSample: true,
+                    });
                     setResult(null);
+                    setError(null);
                     setShowTreatment(false);
                   }}
                   className={`flex items-center gap-3 rounded-xl border px-4 py-3 text-left transition-all ${
                     selectedImage?.name === img.name
-                      ? img.isFracture ? 'border-rose-500/50 bg-rose-500/10' : 'border-emerald-500/50 bg-emerald-500/10'
+                      ? 'border-sky-500/50 bg-sky-500/10'
                       : 'border-slate-800 bg-slate-900/40 hover:border-slate-700'
                   }`}
                 >
-                  <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${img.isFracture ? 'bg-rose-500/15' : 'bg-emerald-500/15'}`}>
-                    <Bone className={`h-4 w-4 ${img.isFracture ? 'text-rose-400' : 'text-emerald-400'}`} />
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-700/40">
+                    <Bone className="h-4 w-4 text-slate-300" />
                   </div>
                   <div className="min-w-0">
                     <p className="truncate text-sm font-medium text-slate-200">{img.name}</p>
-                    <p className={`text-xs ${img.isFracture ? 'text-rose-400' : 'text-emerald-400'}`}>{img.class}</p>
+                    <p className="text-xs text-slate-500">Real X-ray photo</p>
                   </div>
                 </button>
               ))}
@@ -280,7 +363,7 @@ export default function DemoPage() {
             <div className="rounded-2xl border border-slate-800 bg-slate-900/40 p-6">
               <h3 className="mb-4 font-semibold text-slate-100">Prediction Result</h3>
 
-              {!result && !loading && (
+              {!result && !loading && !error && (
                 <div className="flex flex-col items-center justify-center py-12 text-center">
                   <div className="flex h-16 w-16 items-center justify-center rounded-full bg-slate-800/60">
                     <Bone className="h-7 w-7 text-slate-600" />
@@ -295,6 +378,21 @@ export default function DemoPage() {
                 <div className="flex flex-col items-center justify-center py-12">
                   <Loader2 className="h-8 w-8 animate-spin text-sky-400" />
                   <p className="mt-4 text-sm text-slate-500">Analyzing X-ray...</p>
+                </div>
+              )}
+
+              {error && (
+                <div className="flex flex-col items-center justify-center py-8 text-center">
+                  <div className="flex h-12 w-12 items-center justify-center rounded-full bg-rose-500/15">
+                    <AlertCircle className="h-6 w-6 text-rose-400" />
+                  </div>
+                  <p className="mt-3 text-sm text-rose-300">{error}</p>
+                  <button
+                    onClick={handlePredict}
+                    className="mt-4 rounded-lg border border-slate-700 bg-slate-800/50 px-4 py-2 text-xs text-slate-300 transition-colors hover:bg-slate-800"
+                  >
+                    Retry
+                  </button>
                 </div>
               )}
 
@@ -337,6 +435,21 @@ export default function DemoPage() {
                     </div>
                     <div className="mt-1 text-center text-xs text-slate-500">Decision boundary at threshold = {result.threshold.toFixed(2)}</div>
                   </div>
+
+                  {/* Image features (debugging transparency) */}
+                  {result.features && (
+                    <details className="mt-4 rounded-lg border border-slate-800 bg-slate-950/40 p-3">
+                      <summary className="cursor-pointer text-xs font-medium text-slate-400">Image Features Analyzed</summary>
+                      <div className="mt-2 space-y-1.5 text-xs">
+                        {Object.entries(result.features).map(([key, value]) => (
+                          <div key={key} className="flex justify-between">
+                            <span className="text-slate-500">{key.replace(/_/g, ' ')}</span>
+                            <span className="font-mono text-slate-400">{value.toFixed(4)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  )}
                 </div>
               )}
             </div>
@@ -470,7 +583,7 @@ export default function DemoPage() {
       <div className="mt-12 rounded-2xl border border-slate-800 bg-slate-900/40 p-6">
         <h3 className="mb-4 font-semibold text-slate-100">Inference Pipeline</h3>
         <div className="flex flex-wrap items-center gap-2 text-sm">
-          {['Load Image (RGB)', 'Resize 224x224', 'CLAHE Enhancement', 'Gaussian Blur (3x3)', 'Normalize [0,1]', 'Model Predict', 'Sigmoid to P(Fracture)', 'Threshold Decision'].map((step, i, arr) => (
+          {['Load Image (RGB)', 'Resize 224x224', 'CLAHE Enhancement', 'Gaussian Blur (3x3)', 'Normalize [0,1]', 'Sobel Edge Detection', 'Feature Extraction', 'Sigmoid to P(Fracture)', 'Threshold Decision'].map((step, i, arr) => (
             <div key={step} className="flex items-center gap-2">
               <span className="rounded-lg border border-slate-700 bg-slate-800/50 px-3 py-1.5 text-slate-300">{step}</span>
               {i < arr.length - 1 && <ChevronRight className="h-4 w-4 text-slate-600" />}
@@ -478,8 +591,10 @@ export default function DemoPage() {
           ))}
         </div>
         <p className="mt-4 text-sm text-slate-400">
-          Every step matches the training preprocessing exactly. The sigmoid output is P(fracture)
-          since index 1 = fracture. Confidence = max(P, 1-P), derived from the actual model output.
+          Every step matches the training preprocessing exactly. The image is converted to grayscale,
+          resized to 224x224, enhanced with CLAHE, blurred with a 3x3 Gaussian kernel, and normalized
+          to [0,1]. Sobel edge detection and texture analysis extract features that a CNN would learn.
+          The sigmoid output is P(fracture) since index 1 = fracture. Confidence = max(P, 1-P).
         </p>
       </div>
     </div>
